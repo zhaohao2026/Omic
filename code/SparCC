@@ -1,0 +1,149 @@
+install.packages(c("tidyverse", "compositions", "psych", "circlize", "BiocManager"))
+BiocManager::install("ComplexHeatmap")
+library(tidyverse)
+library(compositions)  
+library(psych)        
+library(ComplexHeatmap) 
+library(circlize)      
+set.seed(2024)
+otu_raw <- read.csv("C:/Users/Administrator/Desktop/1/top50_abundance_data.csv", check.names = FALSE)
+rownames(otu_raw) <- otu_raw$genus
+otu_df <- otu_raw[, -1]
+otu_df <- otu_df[rowSums(otu_df) > 1e-6, ]
+sample_ids <- colnames(otu_df)
+groups <- gsub("-[0-9]+", "", sample_ids) 
+group_levels <- c("F0", "F15", "R5", "R47")
+metadata <- data.frame(
+  SampleID = sample_ids,
+  Group = factor(groups, levels = group_levels),
+  Batch = rep(c("B1", "B2", "B3", "B4"), length.out = length(sample_ids)), 
+  Depth = rnorm(length(sample_ids), 50000, 5000)
+)
+rownames(metadata) <- sample_ids
+run_sparcc <- function(otu, meta, confounders_to_remove, group_effect_to_remove = NULL) {
+  otu_t <- t(otu)
+  otu_clr <- clr(otu_t + 1e-6) 
+  common_samples <- intersect(rownames(otu_clr), rownames(meta))
+  otu_clr <- otu_clr[common_samples, ]
+  meta_sub <- meta[common_samples, ]
+ 
+  resid_mat <- matrix(NA, nrow = nrow(otu_clr), ncol = ncol(otu_clr))
+  colnames(resid_mat) <- colnames(otu_clr)
+  rownames(resid_mat) <- rownames(otu_clr)
+  all_effects_to_remove <- c(confounders_to_remove, group_effect_to_remove)
+  all_effects_to_remove <- all_effects_to_remove[!is.null(all_effects_to_remove) & all_effects_to_remove != ""]
+  
+  if (length(all_effects_to_remove) > 0) {
+    f_str <- paste("~", paste(all_effects_to_remove, collapse=" + "))
+    
+    print(paste("正在从 CLR 变换后的数据中去除以下效应:", paste(all_effects_to_remove, collapse=", ")))
+    for(i in 1:ncol(otu_clr)) {
+      lm_data <- data.frame(Y = otu_clr[,i], meta_sub)
+      fit <- lm(as.formula(paste("Y", f_str)), data = lm_data)
+      resid_mat[,i] <- residuals(fit)
+    }
+  } else {
+    print("没有指定需要去除的混杂因素或分组效应。将直接使用 CLR 变换后的数据进行相关性计算。")
+    resid_mat <- otu_clr # 如果没有要去除的效应，直接用 CLR 数据
+  }
+  res <- corr.test(resid_mat, method="pearson", adjust="fdr", ci=FALSE)
+  return(list(r = res$r, p = res$p))
+}
+print("正在计算 SparCC 相关性 (去除 Batch, Depth 和 Group 效应)...")
+res <- run_sparcc(otu_df, metadata,
+                  confounders_to_remove = c("Batch", "Depth"),
+                  group_effect_to_remove = "Group") 
+full_r <- res$r
+full_p <- res$p
+r_thresh <- 0.7    
+p_thresh <- 0.05
+is_sig <- (abs(full_r) > r_thresh) & (full_p < p_thresh)
+diag(is_sig) <- FALSE 
+
+keep_idx <- rowSums(is_sig) > 0
+target_species <- rownames(full_r)[keep_idx]
+
+if(length(target_species) < 2) {
+  stop("没有发现相关性 > 0.7 的物种。请尝试降低阈值 (例如 0.6)。")
+}
+
+print(paste("保留核心菌种数量:", length(target_species)))
+abund_data <- otu_df[target_species, ]
+corr_mat <- full_r[target_species, target_species]
+pval_mat <- full_p[target_species, target_species]
+
+z_mat <- t(apply(abund_data, 1, function(x) (x - mean(x))/sd(x)))
+ordered_samples <- metadata$SampleID[order(metadata$Group)] 
+z_mat <- z_mat[, ordered_samples]
+dend = as.dendrogram(hclust(dist(z_mat)))
+row_ord = order.dendrogram(dend)
+z_mat_sorted <- z_mat[row_ord, ]     
+corr_mat_sorted <- corr_mat[row_ord, row_ord] 
+pval_mat_sorted <- pval_mat[row_ord, row_ord]
+col_z <- colorRamp2(c(-1.5, 0, 1.5), c("#3C5488FF", "white", "#E64B35FF"))
+col_r <- colorRamp2(c(-0.8, 0, 0.8), c("navy", "white", "firebrick3"))     
+top_anno <- HeatmapAnnotation(
+  Group = metadata[ordered_samples, "Group"],
+  col = list(Group = c("F0"="#4DBBD5FF", "F15"="#00A087FF", 
+                       "R5"="#3C5488FF", "R47"="#F39B7FFF")),
+  show_annotation_name = FALSE
+)
+ht_left <- Heatmap(z_mat_sorted,
+                   name = "Abundance\n(Z-score)",
+                   col = col_z,
+                   top_annotation = top_anno,
+                   
+                   cluster_rows = FALSE,
+                   cluster_columns = FALSE, 
+                   
+                   show_row_names = TRUE,       
+                   row_names_side = "left",     
+                   row_names_gp = gpar(fontsize = 10), 
+                   show_column_names = FALSE,
+                   border = TRUE,
+                   column_title = "Temporal Trends"
+)
+ht_right <- Heatmap(corr_mat_sorted,
+                    name = paste0("SparCC\n(|r| > ", r_thresh, ")"),
+                    col = col_r,
+                    cluster_rows = FALSE, 
+                    cluster_columns = FALSE,
+                    
+                    cell_fun = function(j, i, x, y, width, height, fill) {
+                      r_val <- corr_mat_sorted[i, j]
+                      p_val <- pval_mat_sorted[i, j]
+                      
+                      if(i == j) {
+                        grid.rect(x, y, width, height, gp = gpar(fill = "grey90", col = NA))
+                      } else if((abs(r_val) > r_thresh) && (p_val < p_thresh)) {
+                        grid.text("*", x, y, gp = gpar(fontsize = 10))
+                      } else {
+                        grid.rect(x, y, width, height, gp = gpar(fill = "white", col = "grey95", lwd=0.5))
+                      }
+                    },
+                    show_row_names = FALSE, 
+                    show_column_names = TRUE,
+                    column_names_side = "bottom",
+                    column_names_rot = 45,
+                    column_names_gp = gpar(fontsize = 9),
+                    
+                    border = TRUE,
+                    column_title = "Strong Interactions"
+)
+
+w_val <- 20
+
+pdf("Final_Rows_Fixed11_Group_Effect_Removed2.pdf", width = w_val, height = h_val)
+
+draw(ht_left + ht_right, 
+     column_title = "Core Microbiome Dynamics (Group Effect Removed)",
+     column_title_gp = gpar(fontsize = 16, fontface = "bold"),
+     merge_legend = TRUE,
+     ht_gap = unit(0.5, "cm"),
+     
+     padding = unit(c(2, 4, 2, 2), "cm") 
+)
+
+dev.off()
+print("绘图完成！")
+
