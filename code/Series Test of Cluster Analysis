@@ -1,0 +1,655 @@
+# ============================================================
+# 差异基因时序分析 - 禁食再喂养实验
+# 时间点: F0(基线) → F15(禁食15天) → R5(再喂养5天) → R47(再喂养47天)
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(dplyr)
+  library(tidyr)
+  library(pheatmap)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(RColorBrewer)
+  library(ggrepel)
+  library(factoextra)
+  library(e1071)
+  library(viridis)
+  library(cowplot)
+  library(ggpubr)
+  library(scales)
+  library(cluster)
+  library(patchwork)
+  library(ggridges)
+})
+
+setwd("/media/sayhello/Bio/项目资料/Zhanghao/19")
+out_dir <- "timeseries_analysis"
+dir.create(out_dir, showWarnings = FALSE)
+
+# ---- 全局主题 (SCI风格) ----
+theme_sci <- theme_bw() +
+  theme(
+    text = element_text(family = "sans", size = 11),
+    plot.title = element_text(size = 13, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 10, hjust = 0.5, color = "grey40"),
+    axis.title = element_text(size = 11, face = "bold"),
+    axis.text = element_text(size = 9, color = "black"),
+    legend.title = element_text(size = 10, face = "bold"),
+    legend.text = element_text(size = 9),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "grey92", linewidth = 0.4),
+    strip.background = element_rect(fill = "grey95", color = NA),
+    strip.text = element_text(size = 10, face = "bold"),
+    plot.margin = margin(10, 15, 10, 15)
+  )
+
+cat("==============================\n")
+cat("  时序分析启动\n")
+cat("==============================\n\n")
+
+# ============================================================
+# 1. 读取并整理数据
+# ============================================================
+cat("[1] 读取数据...\n")
+
+deg_raw <- read.csv("1.csv", header = TRUE, stringsAsFactors = FALSE)
+expr_raw <- read.csv("2.csv", header = TRUE, stringsAsFactors = FALSE)
+
+# 过滤掉汇总行（Gene.Name 为空）
+deg_data <- deg_raw %>% filter(!is.na(Gene.Name) & Gene.Name != "")
+cat("  DEG 数量:", nrow(deg_data), "\n")
+cat("  表达矩阵 基因数:", nrow(expr_raw), "\n")
+
+# 样本分组信息
+sample_info <- data.frame(
+  sample = c("LF0_4","LF0_7","LF0_8","LF15_2","LF15_4","LF15_5",
+             "LR5_3","LR5_7","LR5_8","LR47_3","LR47_6","LR47_7"),
+  timepoint = factor(rep(c("F0","F15","R5","R47"), each = 3),
+                     levels = c("F0","F15","R5","R47")),
+  group = rep(c("Baseline","Fasting\n15d","Refeeding\n5d","Refeeding\n47d"), each = 3),
+  stringsAsFactors = FALSE
+)
+
+# DEG基因ID
+deg_ids <- deg_data$Gene.ID
+
+# 提取DEG表达矩阵
+expr_cols <- c("Gene.ID", "Gene.Name",
+               "LF0_4","LF0_7","LF0_8",
+               "LF15_2","LF15_4","LF15_5",
+               "LR5_3","LR5_7","LR5_8",
+               "LR47_3","LR47_6","LR47_7")
+expr_deg <- expr_raw %>%
+  filter(Gene.ID %in% deg_ids) %>%
+  select(all_of(expr_cols))
+
+cat("  匹配到的DEG:", nrow(expr_deg), "/", length(deg_ids), "\n\n")
+
+# 数值矩阵
+expr_mat_raw <- as.matrix(expr_deg[, 3:14])
+rownames(expr_mat_raw) <- expr_deg$Gene.Name
+
+# 过滤低表达基因（至少一个样本 > 1）
+keep <- apply(expr_mat_raw, 1, max) > 1
+expr_mat_raw <- expr_mat_raw[keep, ]
+cat("  过滤低表达后保留:", nrow(expr_mat_raw), "个基因\n\n")
+
+# log2(TPM+1) 转换
+expr_mat_log <- log2(expr_mat_raw + 1)
+
+# 计算每个时间点的均值（用于趋势分析）
+timepoints <- c("F0","F15","R5","R47")
+mean_by_tp <- data.frame(
+  Gene = rownames(expr_mat_log),
+  F0   = rowMeans(expr_mat_log[, 1:3]),
+  F15  = rowMeans(expr_mat_log[, 4:6]),
+  R5   = rowMeans(expr_mat_log[, 7:9]),
+  R47  = rowMeans(expr_mat_log[, 10:12])
+)
+
+# Z-score标准化（按基因，用于聚类/热图）
+zscore_mat <- t(scale(t(expr_mat_log)))
+zscore_mat[is.nan(zscore_mat)] <- 0
+
+# ============================================================
+# 2. PCA 分析 - 样本间关系
+# ============================================================
+cat("[2] PCA分析...\n")
+
+pca_res <- prcomp(t(expr_mat_log), scale. = TRUE)
+pca_df <- data.frame(
+  PC1 = pca_res$x[,1],
+  PC2 = pca_res$x[,2],
+  PC3 = pca_res$x[,3],
+  sample = rownames(pca_res$x)
+) %>% left_join(sample_info, by = "sample")
+
+var_pct <- round(summary(pca_res)$importance[2, 1:3] * 100, 1)
+
+tp_colors <- c("F0" = "#4DBBD5", "F15" = "#E64B35", "R5" = "#00A087", "R47" = "#3C5488")
+
+p_pca <- ggplot(pca_df, aes(x = PC1, y = PC2, color = timepoint, shape = timepoint)) +
+  geom_point(size = 4, stroke = 1.2, alpha = 0.9) +
+  geom_text_repel(aes(label = sample), size = 2.8, show.legend = FALSE,
+                  box.padding = 0.3, max.overlaps = 20) +
+  stat_ellipse(aes(group = timepoint), type = "norm", linetype = 2,
+               linewidth = 0.6, alpha = 0.6) +
+  scale_color_manual(values = tp_colors, name = "Time Point") +
+  scale_shape_manual(values = c(16,17,15,18), name = "Time Point") +
+  labs(title = "PCA of DEGs Expression",
+       subtitle = "Fasting-Refeeding Time Series",
+       x = paste0("PC1 (", var_pct[1], "%)"),
+       y = paste0("PC2 (", var_pct[2], "%)")) +
+  theme_sci +
+  theme(legend.position = "right")
+
+ggsave(file.path(out_dir, "01_PCA.pdf"), p_pca, width = 7, height = 5.5)
+ggsave(file.path(out_dir, "01_PCA.png"), p_pca, width = 7, height = 5.5, dpi = 300)
+cat("  PCA图已保存\n")
+
+# ============================================================
+# 3. 样本相关性热图
+# ============================================================
+cat("[3] 样本相关性热图...\n")
+
+cor_mat <- cor(expr_mat_log, method = "pearson")
+colnames(cor_mat) <- sample_info$timepoint[match(colnames(cor_mat), sample_info$sample)]
+rownames(cor_mat) <- colnames(cor_mat)
+
+ann_col <- data.frame(Timepoint = sample_info$timepoint)
+rownames(ann_col) <- sample_info$sample
+colnames(cor_mat) <- rownames(cor_mat) <- sample_info$sample
+
+ann_colors <- list(Timepoint = tp_colors)
+
+pdf(file.path(out_dir, "02_sample_correlation.pdf"), width = 7, height = 6)
+pheatmap(cor_mat,
+         annotation_col = ann_col,
+         annotation_row = ann_col,
+         annotation_colors = ann_colors,
+         color = colorRampPalette(c("#053061","#2166AC","#4393C3","#92C5DE","#F7F7F7",
+                                    "#FDDBC7","#F4A582","#D6604D","#B2182B","#67001F"))(100),
+         border_color = NA,
+         cellwidth = 28, cellheight = 28,
+         treeheight_row = 30, treeheight_col = 30,
+         main = "Sample Pearson Correlation",
+         fontsize = 9,
+         number_color = "black",
+         display_numbers = round(cor_mat, 3),
+         fontsize_number = 6.5)
+dev.off()
+cat("  相关性热图已保存\n")
+
+# ============================================================
+# 4. K-means 聚类时序分析
+# ============================================================
+cat("[4] K-means 时序聚类...\n")
+
+set.seed(42)
+
+# 确定最佳聚类数 (肘部法)
+wss <- sapply(2:10, function(k) {
+  kmeans(zscore_mat, centers = k, nstart = 25, iter.max = 100)$tot.withinss
+})
+
+wss_df <- data.frame(k = 2:10, wss = wss)
+p_elbow <- ggplot(wss_df, aes(x = k, y = wss)) +
+  geom_line(color = "#4DBBD5", linewidth = 1) +
+  geom_point(color = "#E64B35", size = 3) +
+  geom_vline(xintercept = 6, linetype = "dashed", color = "grey50", linewidth = 0.8) +
+  annotate("text", x = 6.3, y = max(wss) * 0.9, label = "k=6", size = 3.5, color = "grey40") +
+  scale_x_continuous(breaks = 2:10) +
+  labs(title = "Elbow Method for Optimal k",
+       x = "Number of Clusters (k)", y = "Total Within-Cluster SS") +
+  theme_sci
+
+ggsave(file.path(out_dir, "03_elbow_plot.pdf"), p_elbow, width = 5, height = 4)
+
+# 使用 k=6 聚类
+k_opt <- 6
+km <- kmeans(zscore_mat, centers = k_opt, nstart = 50, iter.max = 200)
+cluster_assign <- data.frame(
+  Gene = rownames(zscore_mat),
+  Cluster = paste0("Cluster ", km$cluster),
+  stringsAsFactors = FALSE
+)
+
+cat("  各聚类基因数:\n")
+print(table(cluster_assign$Cluster))
+cat("\n")
+
+# 保存聚类结果
+write.csv(cluster_assign, file.path(out_dir, "cluster_assignment.csv"), row.names = FALSE)
+
+# ============================================================
+# 5. 聚类趋势图（折线图）
+# ============================================================
+cat("[5] 绘制聚类趋势图...\n")
+
+# 合并z-score均值
+zscore_mean <- data.frame(
+  Gene = rownames(zscore_mat),
+  F0   = rowMeans(zscore_mat[, 1:3]),
+  F15  = rowMeans(zscore_mat[, 4:6]),
+  R5   = rowMeans(zscore_mat[, 7:9]),
+  R47  = rowMeans(zscore_mat[, 10:12])
+) %>% left_join(cluster_assign, by = "Gene")
+
+zscore_long <- zscore_mean %>%
+  distinct(Gene, .keep_all = TRUE) %>%
+  pivot_longer(cols = c("F0","F15","R5","R47"),
+               names_to = "Timepoint", values_to = "Zscore") %>%
+  mutate(Timepoint = factor(Timepoint, levels = c("F0","F15","R5","R47")))
+
+# 各聚类中心趋势（均值+SE）
+cluster_trend <- zscore_long %>%
+  group_by(Cluster, Timepoint) %>%
+  summarise(
+    mean_z = mean(Zscore, na.rm = TRUE),
+    se_z   = sd(Zscore, na.rm = TRUE) / sqrt(n()),
+    n_gene = n(),
+    .groups = "drop"
+  )
+
+# 自定义颜色
+cluster_colors <- c("Cluster 1" = "#E64B35", "Cluster 2" = "#4DBBD5",
+                    "Cluster 3" = "#00A087", "Cluster 4" = "#3C5488",
+                    "Cluster 5" = "#F39B7F", "Cluster 6" = "#8491B4")
+
+# 计算每个聚类基因数用于标题
+n_per_cluster <- cluster_assign %>% count(Cluster) %>% { setNames(.$n, .$Cluster) }
+
+# 方式1: 每个聚类单独panel，展示所有基因 + 均值趋势
+p_trend_panel <- ggplot() +
+  # 每条基因线（透明）
+  geom_line(data = zscore_long,
+            aes(x = Timepoint, y = Zscore, group = Gene, color = Cluster),
+            alpha = 0.08, linewidth = 0.3) +
+  # 均值线
+  geom_line(data = cluster_trend,
+            aes(x = Timepoint, y = mean_z, group = Cluster, color = Cluster),
+            linewidth = 1.5) +
+  # 误差带
+  geom_ribbon(data = cluster_trend,
+              aes(x = Timepoint, ymin = mean_z - se_z, ymax = mean_z + se_z,
+                  group = Cluster, fill = Cluster),
+              alpha = 0.25) +
+  geom_point(data = cluster_trend,
+             aes(x = Timepoint, y = mean_z, color = Cluster),
+             size = 2.5) +
+  facet_wrap(~Cluster, ncol = 3,
+             labeller = labeller(Cluster = function(x) {
+               paste0(x, "\n(n=", n_per_cluster[x], ")")
+             })) +
+  scale_color_manual(values = cluster_colors) +
+  scale_fill_manual(values = cluster_colors) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey60", linewidth = 0.5) +
+  labs(title = "Temporal Expression Patterns of DEGs",
+       subtitle = "K-means clustering (k=6) | Z-score normalized",
+       x = "Time Point", y = "Expression (Z-score)") +
+  theme_sci +
+  theme(legend.position = "none",
+        axis.text.x = element_text(size = 9))
+
+ggsave(file.path(out_dir, "04_cluster_trends.pdf"), p_trend_panel, width = 10, height = 7)
+ggsave(file.path(out_dir, "04_cluster_trends.png"), p_trend_panel, width = 10, height = 7, dpi = 300)
+
+# 方式2: 所有聚类在同一图中（综合趋势）
+p_trend_all <- ggplot(cluster_trend,
+                      aes(x = Timepoint, y = mean_z, group = Cluster, color = Cluster)) +
+  geom_ribbon(aes(ymin = mean_z - se_z, ymax = mean_z + se_z, fill = Cluster),
+              alpha = 0.15) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey60", linewidth = 0.5) +
+  scale_color_manual(values = cluster_colors,
+                     labels = paste0(names(cluster_colors), " (n=", n_per_cluster[names(cluster_colors)], ")")) +
+  scale_fill_manual(values = cluster_colors,
+                    labels = paste0(names(cluster_colors), " (n=", n_per_cluster[names(cluster_colors)], ")")) +
+  labs(title = "Temporal Expression Trends by Cluster",
+       x = "Time Point", y = "Mean Expression (Z-score)",
+       color = "Cluster", fill = "Cluster") +
+  theme_sci +
+  theme(legend.position = "right")
+
+ggsave(file.path(out_dir, "04b_cluster_trends_combined.pdf"), p_trend_all, width = 7, height = 5)
+ggsave(file.path(out_dir, "04b_cluster_trends_combined.png"), p_trend_all, width = 7, height = 5, dpi = 300)
+cat("  趋势图已保存\n")
+
+# ============================================================
+# 6. DEG热图 (ComplexHeatmap)
+# ============================================================
+cat("[6] 绘制DEG热图...\n")
+
+# 选取z-score方差最大的Top300基因（图清晰）
+gene_var <- apply(zscore_mat, 1, var)
+top_genes <- names(sort(gene_var, decreasing = TRUE))[1:min(300, nrow(zscore_mat))]
+zscore_top <- zscore_mat[top_genes, ]
+
+# 行注释（聚类）
+row_ann_df <- cluster_assign %>% filter(Gene %in% top_genes)
+row_ann <- HeatmapAnnotation(
+  df = data.frame(Cluster = row_ann_df$Cluster[match(top_genes, row_ann_df$Gene)]),
+  col = list(Cluster = cluster_colors),
+  which = "row",
+  show_annotation_name = TRUE,
+  annotation_name_side = "top",
+  width = unit(4, "mm")
+)
+
+# 列注释（时间点）
+col_ann <- HeatmapAnnotation(
+  Timepoint = sample_info$timepoint,
+  col = list(Timepoint = tp_colors),
+  show_annotation_name = TRUE,
+  annotation_name_side = "left",
+  height = unit(4, "mm")
+)
+
+# 颜色映射
+col_fun <- colorRamp2(c(-2, 0, 2), c("#3575B1", "white", "#E31A1C"))
+
+# 排序行（按聚类）
+row_order_idx <- order(row_ann_df$Cluster[match(top_genes, row_ann_df$Gene)])
+
+pdf(file.path(out_dir, "05_heatmap_DEGs.pdf"), width = 9, height = 10)
+ht <- Heatmap(zscore_top[row_order_idx, ],
+              name = "Z-score",
+              col = col_fun,
+              top_annotation = col_ann,
+              left_annotation = row_ann[row_order_idx],
+              cluster_rows = FALSE,
+              cluster_columns = FALSE,
+              show_row_names = FALSE,
+              show_column_names = TRUE,
+              column_names_gp = gpar(fontsize = 8),
+              column_title = paste0("DEG Expression Heatmap (Top ", length(top_genes), " genes)"),
+              column_title_gp = gpar(fontsize = 13, fontface = "bold"),
+              row_title = "Genes",
+              row_title_gp = gpar(fontsize = 10),
+              heatmap_legend_param = list(
+                title = "Z-score",
+                title_gp = gpar(fontsize = 10, fontface = "bold"),
+                labels_gp = gpar(fontsize = 9),
+                legend_height = unit(3, "cm")
+              ),
+              use_raster = TRUE,
+              raster_quality = 3)
+draw(ht, padding = unit(c(5, 5, 10, 5), "mm"))
+dev.off()
+cat("  热图已保存\n")
+
+# ============================================================
+# 7. 差异基因数量汇总图（UpSet风格条形图）
+# ============================================================
+cat("[7] DEG方向性分析图...\n")
+
+# 每个比较的 up/down 数量
+comparisons <- c("L_R5_vs_L_R47","L_F0_vs_L_R5","L_F15_vs_L_R5",
+                 "L_F15_vs_L_R47","L_F0_vs_L_F15","L_F0_vs_L_R47")
+comp_labels <- c("R5 vs R47","F0 vs R5","F15 vs R5","F15 vs R47","F0 vs F15","F0 vs R47")
+
+deg_count <- lapply(seq_along(comparisons), function(i) {
+  col <- gsub("\\.", "_", comparisons[i])
+  col <- gsub("__", "_", col)
+  vals <- deg_data[[comparisons[i]]]
+  up <- sum(grepl("yes\\|up", vals), na.rm = TRUE)
+  down <- sum(grepl("yes\\|down", vals), na.rm = TRUE)
+  data.frame(Comparison = comp_labels[i], Direction = c("Up","Down"),
+             Count = c(up, down))
+}) %>% bind_rows()
+
+deg_count$Comparison <- factor(deg_count$Comparison,
+                                levels = rev(comp_labels))
+
+p_deg_bar <- ggplot(deg_count, aes(x = Comparison,
+                                    y = ifelse(Direction == "Down", -Count, Count),
+                                    fill = Direction)) +
+  geom_col(width = 0.65, alpha = 0.9) +
+  geom_text(aes(label = Count,
+                y = ifelse(Direction == "Down", -Count - 15, Count + 15)),
+            size = 3.2, fontface = "bold") +
+  coord_flip() +
+  scale_fill_manual(values = c("Up" = "#E31A1C", "Down" = "#3575B1"),
+                    name = "Regulation") +
+  scale_y_continuous(labels = function(x) abs(x),
+                     breaks = seq(-600, 600, 200)) +
+  geom_hline(yintercept = 0, color = "black", linewidth = 0.6) +
+  labs(title = "DEG Count per Comparison",
+       subtitle = "Up- and Down-regulated genes",
+       x = NULL, y = "Number of DEGs") +
+  theme_sci +
+  theme(legend.position = "top",
+        panel.grid.major.y = element_blank(),
+        panel.grid.major.x = element_line(color = "grey90"))
+
+ggsave(file.path(out_dir, "06_DEG_counts.pdf"), p_deg_bar, width = 7, height = 5)
+ggsave(file.path(out_dir, "06_DEG_counts.png"), p_deg_bar, width = 7, height = 5, dpi = 300)
+cat("  DEG计数图已保存\n")
+
+# ============================================================
+# 8. 时序表达盒须图（每时间点表达分布）
+# ============================================================
+cat("[8] 时序表达分布图...\n")
+
+# 长格式数据（所有DEG）
+expr_long <- expr_mat_log %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("Gene") %>%
+  pivot_longer(-Gene, names_to = "sample", values_to = "Expression") %>%
+  left_join(sample_info, by = "sample")
+
+expr_long$timepoint <- factor(expr_long$timepoint, levels = c("F0","F15","R5","R47"))
+
+p_violin <- ggplot(expr_long, aes(x = timepoint, y = Expression,
+                                   fill = timepoint, color = timepoint)) +
+  geom_violin(alpha = 0.35, scale = "width", trim = TRUE) +
+  geom_boxplot(width = 0.15, outlier.shape = NA, alpha = 0.8,
+               color = "black", linewidth = 0.5) +
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 2.5,
+               fill = "white", color = "black") +
+  scale_fill_manual(values = tp_colors) +
+  scale_color_manual(values = tp_colors) +
+  scale_y_continuous(expand = expansion(mult = 0.05)) +
+  labs(title = "DEG Expression Distribution Across Time Points",
+       x = "Time Point", y = "Expression [log2(TPM+1)]") +
+  theme_sci +
+  theme(legend.position = "none")
+
+ggsave(file.path(out_dir, "07_expression_violin.pdf"), p_violin, width = 6, height = 5)
+ggsave(file.path(out_dir, "07_expression_violin.png"), p_violin, width = 6, height = 5, dpi = 300)
+cat("  小提琴图已保存\n")
+
+# ============================================================
+# 9. Soft 聚类（用 e1071::cmeans 实现 fuzzy c-means）
+# ============================================================
+cat("[9] Fuzzy C-means 软聚类...\n")
+
+set.seed(123)
+fcm <- cmeans(zscore_mat, centers = k_opt, iter.max = 200, m = 1.25)
+
+# 每个基因最高隶属度
+membership_max <- apply(fcm$membership, 1, max)
+fcm_cluster <- data.frame(
+  Gene = rownames(zscore_mat),
+  FCM_Cluster = paste0("Cluster ", fcm$cluster),
+  Membership = membership_max
+)
+
+# 按隶属度绘制分布（反映聚类质量）
+p_membership <- ggplot(fcm_cluster, aes(x = Membership, fill = FCM_Cluster)) +
+  geom_histogram(bins = 30, alpha = 0.8, position = "stack") +
+  scale_fill_manual(values = cluster_colors, name = "Cluster") +
+  geom_vline(xintercept = 0.5, linetype = "dashed", color = "grey40") +
+  labs(title = "Fuzzy C-means Membership Score Distribution",
+       subtitle = "Higher values indicate stronger cluster membership",
+       x = "Maximum Membership Score", y = "Number of Genes") +
+  theme_sci
+
+ggsave(file.path(out_dir, "08_fcm_membership.pdf"), p_membership, width = 7, height = 4.5)
+
+# 选高置信度成员（membership > 0.6）绘趋势
+fcm_high <- fcm_cluster %>% filter(Membership > 0.6)
+cat("  高置信度基因 (membership>0.6):", nrow(fcm_high), "\n\n")
+
+# ============================================================
+# 10. 变化轨迹分类（表达模式分类）
+# ============================================================
+cat("[10] 表达变化轨迹分析...\n")
+
+# 基于F0基线的标准化折变量
+pattern_df <- mean_by_tp %>%
+  mutate(
+    dF15 = F15 - F0,   # 禁食响应
+    dR5  = R5  - F0,   # 再喂养早期
+    dR47 = R47 - F0,   # 再喂养晚期
+    # 分类模式
+    pattern = case_when(
+      dF15 < -0.5 & dR5 > -0.5 ~ "Fasting-Down\nRefeeding-Recover",
+      dF15 > 0.5  & dR5 < 0.5  ~ "Fasting-Up\nRefeeding-Down",
+      dF15 < -0.5 & dR5 < -0.5 & dR47 > -0.3 ~ "Late-Recover",
+      dF15 > 0.5  & dR5 > 0.5  ~ "Sustained-Up",
+      dF15 < -0.5 & dR47 < -0.5 ~ "Sustained-Down",
+      abs(dR47 - dF15) > 1 & abs(dF15) < 0.5 ~ "Refeeding-Specific",
+      TRUE ~ "Other"
+    )
+  )
+
+# 统计各模式数量
+pattern_count <- pattern_df %>%
+  count(pattern) %>%
+  arrange(desc(n)) %>%
+  mutate(pct = round(n / sum(n) * 100, 1),
+         label = paste0(n, "\n(", pct, "%)"))
+
+p_pattern_bar <- ggplot(pattern_count, aes(x = reorder(pattern, n), y = n, fill = pattern)) +
+  geom_col(width = 0.7, alpha = 0.9, color = "white") +
+  geom_text(aes(label = label), hjust = -0.1, size = 3) +
+  coord_flip(clip = "off") +
+  scale_fill_manual(values = colorRampPalette(
+    c("#E64B35","#4DBBD5","#00A087","#3C5488","#F39B7F","#8491B4","#91D1C2")
+  )(nrow(pattern_count))) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.3))) +
+  labs(title = "DEG Expression Trajectory Classification",
+       x = NULL, y = "Number of Genes") +
+  theme_sci +
+  theme(legend.position = "none",
+        panel.grid.major.y = element_blank())
+
+ggsave(file.path(out_dir, "09_expression_patterns.pdf"), p_pattern_bar, width = 8, height = 5)
+ggsave(file.path(out_dir, "09_expression_patterns.png"), p_pattern_bar, width = 8, height = 5, dpi = 300)
+cat("  轨迹分类图已保存\n")
+
+# ============================================================
+# 11. Top 变化基因气泡图
+# ============================================================
+cat("[11] Top变化基因气泡图...\n")
+
+# 找出在禁食期变化最大的30个基因
+top30_fasting <- pattern_df %>%
+  mutate(abs_change = abs(dF15)) %>%
+  top_n(30, abs_change) %>%
+  arrange(desc(abs_change))
+
+top30_long <- top30_fasting %>%
+  select(Gene, F0, F15, R5, R47) %>%
+  pivot_longer(-Gene, names_to = "Timepoint", values_to = "MeanExpr") %>%
+  mutate(Timepoint = factor(Timepoint, levels = c("F0","F15","R5","R47")))
+
+# 添加方向信息
+top30_long <- top30_long %>%
+  left_join(top30_fasting %>% select(Gene, dF15), by = "Gene") %>%
+  mutate(Direction = ifelse(dF15 > 0, "Fasting-Up", "Fasting-Down"))
+
+p_bubble <- ggplot(top30_long, aes(x = Timepoint, y = reorder(Gene, dF15),
+                                    size = MeanExpr, color = MeanExpr)) +
+  geom_point(alpha = 0.85) +
+  scale_size_continuous(range = c(1, 8), name = "log2(TPM+1)") +
+  scale_color_gradient2(low = "#3575B1", mid = "#FFFFCC", high = "#E31A1C",
+                        midpoint = median(top30_long$MeanExpr),
+                        name = "log2(TPM+1)") +
+  facet_wrap(~Direction, scales = "free_y", ncol = 2) +
+  labs(title = "Top 30 Fasting-Responsive DEGs",
+       subtitle = "Bubble size and color indicate expression level",
+       x = "Time Point", y = NULL) +
+  theme_sci +
+  theme(axis.text.y = element_text(size = 7))
+
+ggsave(file.path(out_dir, "10_top30_bubble.pdf"), p_bubble, width = 10, height = 8)
+ggsave(file.path(out_dir, "10_top30_bubble.png"), p_bubble, width = 10, height = 8, dpi = 300)
+cat("  气泡图已保存\n")
+
+# ============================================================
+# 12. 聚类热图（每个cluster的表达均值热图）
+# ============================================================
+cat("[12] 聚类中心热图...\n")
+
+# 聚类中心（Z-score均值）
+cluster_center <- zscore_long %>%
+  group_by(Cluster, Timepoint) %>%
+  summarise(mean_z = mean(Zscore, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = Timepoint, values_from = mean_z) %>%
+  as.data.frame() %>%
+  { rownames(.) <- .$Cluster; . } %>%
+  select(-Cluster)
+
+cluster_center_mat <- as.matrix(cluster_center[, c("F0","F15","R5","R47")])
+
+pdf(file.path(out_dir, "11_cluster_center_heatmap.pdf"), width = 5, height = 5)
+pheatmap(cluster_center_mat,
+         color = colorRampPalette(c("#3575B1","white","#E31A1C"))(100),
+         border_color = "white",
+         cellwidth = 40, cellheight = 35,
+         display_numbers = round(cluster_center_mat, 2),
+         number_color = "black",
+         fontsize_number = 10,
+         cluster_cols = FALSE,
+         treeheight_row = 25,
+         main = "Cluster Expression Centroids (Z-score)",
+         fontsize = 11,
+         angle_col = "0")
+dev.off()
+cat("  聚类中心热图已保存\n")
+
+# ============================================================
+# 13. 综合趋势汇总图（多面板）
+# ============================================================
+cat("[13] 综合汇总图...\n")
+
+# 组合 PCA + DEG计数 + 小提琴图 + 趋势图
+combined <- (p_pca | p_deg_bar) / (p_violin | p_trend_all) +
+  plot_annotation(
+    title = "Fasting-Refeeding DEG Time Series Analysis",
+    subtitle = paste0("Total DEGs: ", nrow(expr_deg), " | Timepoints: F0 → F15 → R5 → R47"),
+    theme = theme(
+      plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(size = 10, hjust = 0.5, color = "grey40")
+    )
+  ) +
+  plot_layout(heights = c(1, 1))
+
+ggsave(file.path(out_dir, "00_summary_panel.pdf"), combined, width = 14, height = 11)
+ggsave(file.path(out_dir, "00_summary_panel.png"), combined, width = 14, height = 11, dpi = 300)
+cat("  综合汇总图已保存\n")
+
+# ============================================================
+# 14. 保存统计汇总
+# ============================================================
+cat("[14] 保存统计汇总...\n")
+
+# 完整分析结果表
+result_table <- mean_by_tp %>%
+  left_join(cluster_assign %>% distinct(Gene, .keep_all = TRUE), by = "Gene") %>%
+  left_join(pattern_df %>% select(Gene, dF15, dR5, dR47, pattern), by = "Gene") %>%
+  left_join(fcm_cluster %>% select(Gene, FCM_Cluster, Membership), by = "Gene")
+
+write.csv(result_table, file.path(out_dir, "timeseries_results_full.csv"), row.names = FALSE)
+
+cat("\n==============================\n")
+cat("  分析完成！\n")
+cat("==============================\n")
+cat("输出目录:", out_dir, "\n\n")
+cat("生成文件列表:\n")
+files <- list.files(out_dir, full.names = FALSE)
+for (f in sort(files)) cat("  ", f, "\n")
